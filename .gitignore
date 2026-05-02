@@ -2,3 +2,4 @@
 .venv/
 myrl/
 .python-version
+__pycache__/

@@ -4,26 +4,36 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
-import time
+from tqdm import tqdm
 
 from helper import Policy_net, Value_net, discount_rewards
 
 value_h = 128
 policy_h = 128
 value_lr = 1e-2
-policy_lr = 1e-3
+policy_lr = 5e-4
 max_length = 200
 epochs = 1000
 episodes_per_epoch = 10
 
 
 class VPG:
-    def __init__(self, env, policy_h = policy_h, value_h = value_h):
+    def __init__(self, 
+                 env,
+                 device, 
+                 policy_h = policy_h, 
+                 value_h = value_h):
         self.env = env
-        self.policy_net = Policy_net(env.observation_space.shape[0], policy_h, env.action_space.n)
-        self.value_net = Value_net(env.observation_space.shape[0], value_h)
+        self.device = device
+        self.policy_net = Policy_net(env.observation_space.shape[0],policy_h, env.action_space.n, device)
+        self.value_net = Value_net(env.observation_space.shape[0], value_h, device)
 
-    def train(self, value_lr = value_lr, policy_lr = policy_lr, max_length = max_length, epochs = epochs, episodes_per_epoch = episodes_per_epoch):
+    def train(self, 
+              value_lr = value_lr, 
+              policy_lr = policy_lr, 
+              max_length = max_length, 
+              epochs = epochs, 
+              episodes_per_epoch = episodes_per_epoch):
         """
         Train both the value_net and the policy_net
         """
@@ -31,13 +41,10 @@ class VPG:
         value_optim = torch.optim.Adam(self.value_net.parameters(), lr = value_lr)
         policy_optim = torch.optim.Adam(self.policy_net.parameters(), lr = policy_lr)
         rewards = []
-        for epoch in range(epochs):
+        for epoch in tqdm(range(epochs), desc="Training"):
             epoch_rewards = []
-            value_loss = torch.tensor([[0.0]], dtype = torch.float32, requires_grad = True)
-            policy_loss = torch.tensor([[0.0]], dtype = torch.float32, requires_grad = True)
-
             for episode in range(episodes_per_epoch):
-                observation = self.env.reset()
+                observation, info = self.env.reset()
                 episode_states = []
                 episode_values = []
                 episode_actions = []
@@ -46,7 +53,7 @@ class VPG:
                 done = False
 
                 for i in range(max_length):
-                    observation = torch.tensor(observation, dtype = torch.float32)
+                    observation = torch.tensor(observation, dtype = torch.float32, device=self.device)
                     episode_states.append(observation)
                     value = self.value_net.forward(observation)
                     episode_values.append(value)
@@ -56,7 +63,7 @@ class VPG:
                     episode_actions.append(action)
                     episode_action_dist.append(action_distribution)
 
-                    observation, reward, done, _ = self.env.step(action.item())
+                    observation, reward, done, _, _ = self.env.step(action.item())
 
                     episode_rewards.append(reward)
 
@@ -70,28 +77,30 @@ class VPG:
                 discounted_rewards = (discounted_rewards - np.mean(discounted_rewards))/(np.std(discounted_rewards) + 1e-5)
 
                 #convert to a tensor
-                discounted_rewards = torch.tensor(discounted_rewards, dtype = torch.float32)
-                episode_values = torch.tensor(episode_values)
-                value_loss = value_loss + nn.MSELoss()(episode_values, discounted_rewards)
+                discounted_rewards = torch.tensor(discounted_rewards, dtype = torch.float32, device=self.device, requires_grad=True)
+                # print(f"discounted_rewards.shape: {discounted_rewards.shape}")
 
+                episode_values = torch.tensor(episode_values, device=self.device, requires_grad=True).squeeze()     
+                value_loss = nn.MSELoss()(episode_values, discounted_rewards)
+
+
+                # NOTES TO SELF: I AM SURE THIS COULD HAVE BEEN DONE BETTER
+                policy_loss = torch.tensor(0.0, device=self.device) 
                 for j in range(len(episode_rewards) - 1):
                     #Using baseline as the value to reduce variance
                     advantage = discounted_rewards[j] - episode_values[j]
 
-                    policy_loss = policy_loss - episode_action_dist[j].log_prob(episode_actions[j]) * advantage
-
+                    episode_policy_loss = - episode_action_dist[j].log_prob(episode_actions[j]) * advantage
+                    policy_loss += episode_policy_loss
                 epoch_rewards.append(np.sum(episode_rewards))
 
             #Fit the value function and the policy function
-            value_loss /= episodes_per_epoch
+            value_optim.zero_grad()
             value_loss.backward()
             value_optim.step()
-            value_optim.zero_grad()
-
-            policy_loss/= episodes_per_epoch
+            policy_optim.zero_grad()
             policy_loss.backward()
             policy_optim.step()
-            policy_optim.zero_grad()
 
             avg_episode_reward = np.mean(epoch_rewards[-episodes_per_epoch:])
             rewards.append(avg_episode_reward)
@@ -104,6 +113,9 @@ class VPG:
 
         self.env.close()
 
+        plt.plot(rewards)
+        plt.show()
+
     def save(self):
         pass
 
@@ -111,40 +123,50 @@ class VPG:
         pass
 
     def eval(self, episodes):
-        """
-        Evaluates the policy learnt for the specified number of episodes
-        """
-        start = time.time()
-        total_rewards = []
-        for i in range(episodes):
-            observation = self.env.reset()
-            episode_rewards = []
-            done = False
+        with torch.no_grad():
+            """
+            Evaluates the policy learnt for the specified number of episodes
+            """
+            imgs = []
+            total_rewards = []
+            for i in range(episodes):
+                observation, _ = self.env.reset()
+                episode_rewards = []
+                done = False
 
-            while not done:
-                observation = torch.tensor(observation, dtype = torch.float32)
-                action_probs = self.policy_net.forward(observation)
-                action_distribution = torch.distributions.Categorical(action_probs)
-                action = action_distribution.sample()
+                while not done:
+                    observation = torch.tensor(observation, dtype = torch.float32)
+                    action_probs = self.policy_net.forward(observation)
+                    action_distribution = torch.distributions.Categorical(action_probs)
+                    action = action_distribution.sample()
 
-                observation, reward, done, _ = self.env.step(action.item())
-                episode_rewards.append(reward)
+                    observation, reward, done, _, _ = self.env.step(action.item())
+                    episode_rewards.append(reward)
 
-            total = np.sum(episode_rewards)
-            total_rewards.append(total)
-            print("Total episode reward %f" % total)
+                total = np.sum(episode_rewards)
+                total_rewards.append(total)
+                print("Total episode reward %f" % total)
 
-        print("Average episode reward %f" % np.mean(total_rewards))
-        self.env.close()
+            print("Average episode reward %f" % np.mean(total_rewards))
+            self.env.close()
+
 
 if __name__ == "__main__":
-    import gym
-    env = gym.make("CartPole-v1")
+    import gymnasium as gym
+    env = gym.make("CartPole-v1", render_mode="rgb_array")
 
     #Hyperparameters
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-    model = VPG(env, policy_h, value_h)
+    model = VPG(env, device, policy_h, value_h)
     model.train()
-    model.eval(10)
+
+
+    # JUST FOR INFERECE
+    # CAREFUL RUNNING THIS ON A MAC CONNECTED TO A DISPLAY PORT, IT MAY CRASH THE SYSTEM
+    new_env = gym.make("CartPole-v1", render_mode="human")
+    eval_model = VPG(new_env, device, policy_h, value_h)
+    eval_model.policy_net.load_state_dict(model.policy_net.state_dict())
+    eval_model.value_net.load_state_dict(model.value_net.state_dict())
+    eval_model.eval(10)
